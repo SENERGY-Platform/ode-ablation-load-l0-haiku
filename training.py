@@ -7,6 +7,10 @@ The model is a seasonal profile over local hour of week (168 slots). Each slot
 holds an exponentially recency-weighted mean of the hourly means of the target
 series that fell in it. A slot with no history takes the overall weighted mean.
 
+The registered model can also return that overall weighted mean for every
+timestamp, when asked with "constant": True. That is the reference forecast the
+profile has to beat, and it is what launch 3 scores.
+
 Assumption: the site keeps local time in Europe/Berlin. Hour of week is taken in
 that zone, so daily and weekly load shapes stay aligned across the clock change.
 
@@ -42,7 +46,8 @@ class SeasonalLoadModel(PythonModel):
     """The model MLflow registers and op.py later loads.
 
     predict() receives the target timestamp and returns the profile value for its
-    local hour of week. Keep it serialisable: MLflow stores this object.
+    local hour of week, or the overall weighted mean when the payload carries
+    "constant": True. Keep it serialisable: MLflow stores this object.
     """
 
     def __init__(self, profile: typing.List[float], fallback: float) -> None:
@@ -62,6 +67,8 @@ class SeasonalLoadModel(PythonModel):
         # model is called directly, so the payload is taken from whichever argument
         # holds it.
         payload = model_input if model_input is not None else context
+        if payload.get("constant"):
+            return self.fallback
         value = self.profile[self.slot_of(payload["timestamp"])]
         return value if value is not None else self.fallback
 

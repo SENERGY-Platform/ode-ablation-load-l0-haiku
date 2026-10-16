@@ -10,16 +10,13 @@ h + 24h, at the first message it sees in hour h. The forecast carries the target
 hour as its result timestamp, so an evaluation bucketed by result time compares
 it with the hourly mean of the target series at that same hour.
 
-Level correction. The profile is a shape over the week. To follow a level that
-has moved since training, the operator keeps the difference between each observed
-hour and the profile for that hour, over the last 24 hours, and adds the mean of
-those differences to every forecast. Until 24 hours have been observed the
-forecast is the profile alone.
+Current mode: constant reference. The forecast is the training mean of the target
+(the model's overall weighted mean), with no profile and no level correction. This
+is the reference that any shape model has to beat, so launch 3 scores it.
 
 Three methods are yours. Everything else belongs to the library.
 """
 
-import collections
 import datetime
 import typing
 
@@ -32,7 +29,6 @@ from training import train_model
 
 UTC = datetime.timezone.utc
 HORIZON = datetime.timedelta(hours=24)
-CORRECTION_HOURS = 24
 
 
 class CustomConfig(Config):
@@ -57,8 +53,7 @@ def _as_utc_hour(timestamp: datetime.datetime) -> datetime.datetime:
 class Operator(MLOperator):
     configType = CustomConfig
 
-    # The inputs this operator accepts. The value is the observed power that the
-    # level correction is computed from.
+    # The inputs this operator accepts. The forecast does not read the value.
     selectors = [
         Selector({"name": "value", "args": ["value"]}),
     ]
@@ -70,32 +65,7 @@ class Operator(MLOperator):
         self.trained_at: typing.Optional[datetime.datetime] = None
         # The hour for which a forecast was last issued. One forecast per hour.
         self.last_issued_hour: typing.Optional[datetime.datetime] = None
-        self._reset_level()
         super().init(*args, **kwargs)
-
-    def _reset_level(self) -> None:
-        """Forget the observed hour and the deviations from the profile.
-
-        Called when a new model is trained, because the deviations were measured
-        against the profile that model replaces.
-        """
-        self.current_hour: typing.Optional[datetime.datetime] = None
-        self.hour_sum = 0.0
-        self.hour_count = 0
-        self.deviations: typing.Deque[float] = collections.deque(maxlen=CORRECTION_HOURS)
-
-    def _close_hour(self, model: PyFuncModel) -> None:
-        """Record how far the hour just ended was from the profile for that hour."""
-        if self.hour_count == 0 or self.current_hour is None:
-            return
-        observed = self.hour_sum / self.hour_count
-        profile = float(model.predict({"timestamp": self.current_hour}))
-        self.deviations.append(observed - profile)
-
-    def _level_correction(self) -> float:
-        if not self.deviations:
-            return 0.0
-        return sum(self.deviations) / len(self.deviations)
 
     def infer(
         self,
@@ -109,33 +79,19 @@ class Operator(MLOperator):
     ]:
         """Called for every message. Returns (result timestamp, result, new model).
 
-        Accumulates the observed hour, and issues the forecast for the hour 24 hours
-        after the current one, once per hour. The result timestamp is that target
-        hour, so the forecast is recorded against the time it is about.
+        Issues the constant reference forecast for the hour 24 hours after the
+        current one, once per hour. The result timestamp is that target hour.
         """
         if model is None:
             return None, None, None
 
         hour = _as_utc_hour(timestamp)
-        if self.current_hour is None:
-            self.current_hour = hour
-        elif hour != self.current_hour:
-            self._close_hour(model)
-            self.current_hour = hour
-            self.hour_sum = 0.0
-            self.hour_count = 0
-
-        value = data.get("value")
-        if value is not None:
-            self.hour_sum += float(value)
-            self.hour_count += 1
-
         if hour == self.last_issued_hour:
             return None, None, None
         self.last_issued_hour = hour
 
         target = hour + HORIZON
-        prediction = float(model.predict({"timestamp": target})) + self._level_correction()
+        prediction = float(model.predict({"timestamp": target, "constant": True}))
         return target, {"prediction": prediction}, None
 
     def train(
@@ -148,7 +104,6 @@ class Operator(MLOperator):
         resulting model is registered from.
         """
         self.trained_at = datetime.datetime.now(UTC)
-        self._reset_level()
         return train_model(logger)
 
     def need_retraining(self, model: typing.Optional[PyFuncModel]) -> bool:
